@@ -25,7 +25,7 @@ phone charger).
 
 Thingiverse link: https://www.thingiverse.com/thing:6865302
 
-Printables link: TODO
+Printables link: https://www.printables.com/model/1120003-ikea-fridans-motorisation
 
 Detailed instructions: https://www.nedprod.com/Niall_stuff/vdiary/archives/1734888387.html
 
