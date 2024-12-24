@@ -60,7 +60,7 @@ white PETG. I wouldn't recommend PLA, the 3D printed parts
 take a lot of repeated torsion stress and PLA doesn't do
 well with that over time.
 
-<center><img  src="https://github.com/ned14/YAIFM/blob/bc2eac0214da801eba641189d6be2e2194ece3fc/Images/20241015_122559.jpg" width="3024" height="4032" style="width:45%;height:auto;"> <img src="https://github.com/ned14/YAIFM/blob/bc2eac0214da801eba641189d6be2e2194ece3fc/Images/20241015_122559.jpg" width="3024" height="4032" style="width:45%;height:auto;"></center>
+<img src="https://github.com/ned14/YAIFM/blob/d88eb432634e654cb08949fb2025a30c5706809c/Images/20241015_122448.jpg" width="3024" height="4032" style="width:33%;height:33%;">
  
 5. Two steel washers to go between the cog/hub
 and the motor to put as much horizontal load onto the motor
@@ -79,7 +79,7 @@ absolute confidence that there is enough motor power for the
 200 cm blind. They cost between €18 and €28 inc VAT depending
 on size.
 
-<video controls="1" style="width:85%;height:auto;" type="video/mp4"><source src="https://github.com/ned14/YAIFM/raw/refs/heads/main/Images/20241015_120008.mp4" type="video/mp4"></video>
+https://github.com/user-attachments/assets/c323144f-e48f-4d71-8c1b-16eb3580f487
 
 
 ## Wiring
