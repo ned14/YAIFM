@@ -1,0 +1,463 @@
+### Inputs (4):
+#   - GPI34 is button, defaults to pulled up
+#   - GPI35 is battery voltage if jumper fused
+#   - GPI36 is RXD for UART1 on UEXT, if not using UART then free to use
+#   - GPI39 is external power supply voltage 47k/100k would yield 5.0v ~= 3.4v (max ADC is 3.12v) (HARDWIRED), so using this as a digital input makes more sense. The 47k resistor means this could be considered default pulled up.
+#
+### Outputs free to use (10):
+#   - Not on UEXT: GPIO0, GPIO1, GPIO3, GPIO32, GPIO33
+#   - On UEXT:     GPIO2, GPIO5, GPIO14, GPIO15
+#   - GPIO4 is TXD for UART1 on UEXT, if not using UART then free to use
+#
+### Outputs generally in use (2):
+#   - GPIO13 is I2C-SDA (UEXT)
+#   - GPIO16 is I2C-SCL (UEXT)
+#
+### Outputs useful to keep free (2):
+#   - GPIO1 is UART TXD for USB logging (always causes it to go high during early boot)
+#   - GPIO3 is UART RXD for USB logging
+#
+#
+# GPI34  (PINS) is (default pulled up)
+# GPI35  (PINS) is wall dimmer switch level shifted down to TTL
+# GPI36  (UEXT) is blind motor sensor B
+# GPI39  (PINS) is (default pulled up)
+#
+# GPIO0  (PINS) is LED strip colour ?
+# GPIO1  (PINS) is
+# GPIO2  (UEXT) is blind motor PWM forwards?
+# GPIO3  (PINS) is blind motor PWM backwards?
+# GPIO4  (PINS) is blind motor sensor A
+# GPIO5  (UEXT) is LED strip colour ?
+# GPIO13 (UEXT) is I2C-SDA
+# GPIO14 (UEXT) is LED strip colour ?
+# GPIO15 (PINS) is LED strip colour ?
+# GPIO16 (UEXT) is I2C-SCL
+# GPIO32 (PINS) is ventilation fan forwards
+# GPIO33 (PINS) is ventilation fan backwards
+
+
+# If using the BTS7960 motor driver:
+#   - PWM output for forwards
+#   - PWM output for backwards
+#   - Output for enable
+#   - Optional: Input for forward current consumption (needs 1.7K resistor to produce a voltage range from a shunt to represent 0 - 5 amps due to 8500 scaling factor)
+#   - Optional: Input for backwards current consumption (needs 1.7K resistor to produce a voltage range from a shunt to represent 0 - 5 amps due to 8500 scaling factor)
+
+substitutions:
+  # Irritatingly, blind_encoder reports NaN if it's never turned even if we ask for ALWAYS_ZERO
+  blind_encoder_state: '(isnan(id(blind_encoder)->state) ? 0.0f : id(blind_encoder)->state)'
+  current_blind_ratio: '((float)(${blind_encoder_state} - id(blind_encoder_abs_open_fully)) / (float) id(blind_encoder_rel_closed_fully))'
+  blind_encoder_rel_slow_down: '(5000)'
+
+esphome:
+  name: room-prototype
+  platform: ESP32
+  board: esp32-poe
+  on_boot:
+    priority: 799  # Run this as soon as possible
+    then:
+      # Annoyingly the motor turns on boot
+      - output.set_level:
+          id: blind_forwards
+          level: '0%'
+      - output.set_level:
+          id: blind_backwards
+          level: '0%'
+      # Wait for ethernet to establish, it itself waits 300 ms before doing anything
+      - delay: 15s
+
+      # When we first boot, we have no idea where the blind is. We could store to
+      # flash, but the blind could have been changed during power off. Also,
+      # when we first turn it on, I notice the motor turns for a bit before boot.
+      # So drop it slighly first, then open it until it stops then we can
+      # establish what 'fully open' means.
+      #
+      # Run it forwards for half a second
+      - lambda: |-
+          if(isnan(id(blind_encoder_rel_current)) || id(blind_encoder_rel_current) < 0.0f || id(blind_encoder_rel_current) > 1.0f) id(blind_encoder_rel_current) = 0.1f;
+      - globals.set:
+          id: old_blind_encoder_rel_current
+          value: !lambda 'return id(blind_encoder_rel_current);'
+      - logger.log:
+          format: "On boot, blind closed fully = %d and setting before power loss = %.1f"
+          args: [ 'id(blind_encoder_rel_closed_fully)', 'id(blind_encoder_rel_current)' ]
+      - globals.set:
+          id: blind_encoder_abs_open_fully
+          value: '999999999'
+      - script.execute:
+          id: do_position_blind
+          pos: 1.0  # open
+          speed: 1.0
+      - delay: 0.5s
+      # Run it backwards until it stops turning
+      - globals.set:
+          id: blind_encoder_abs_open_fully
+          value: '-999999999'
+      - script.execute:
+          id: do_position_blind
+          pos: 0.0  # close
+          speed: 1.0  # get it started
+      - delay: 0.25s
+      - script.execute:
+          id: do_position_blind
+          pos: 0.0  # close
+          speed: 0.33  # take it easy after to reduce motor heating
+      - script.wait:
+          id: do_position_blind
+      - delay: 1s
+      # Now that blind_encoder_abs_open_fully has been determined,
+      # restore the blind back to where it was
+      - logger.log:
+          format: "On boot, blind fully open determined to be %d. Restoring blind position to previous %f"
+          args: [ 'id(blind_encoder_abs_open_fully)', 'id(old_blind_encoder_rel_current)' ]
+      - script.execute:
+          id: do_position_blind
+          pos: !lambda 'return id(old_blind_encoder_rel_current);'
+          speed: 1.0
+
+globals:
+  - id: current_blind_operation       # >0 for closing, <0 for opening
+    type: float
+  - id: blind_encoder_stop            # when to stop
+    type: int
+    initial_value: '-999999999'
+  - id: blind_encoder_abs_open_fully  # rotary encoder value for where it stopped
+    type: int                         # turning during last full open
+    initial_value: '-999999999'
+  - id: last_blind_encoder_state
+    type: float
+  - id: old_blind_encoder_rel_current
+    type: float
+  - id: old_current_blind_operation
+    type: float
+
+  # Persistent
+  - id: blind_encoder_rel_closed_fully  # relative to blind_encoder_abs_open_fully,
+    type: int                           # how far to turn to 'fully close'
+    initial_value: '70000'              # approx 1 metre
+    restore_value: yes
+  - id: blind_encoder_rel_current     # relative to blind_encoder_abs_open_fully and
+    type: float                       # blind_encoder_rel_closed_fully, a float between
+    initial_value: '0.1f'             # 0.0 and 1.0. This is the last setting.
+    restore_value: yes
+
+script:
+  - id: do_publish_blind
+    then:
+      - cover.template.publish:
+          id: blind_cover
+          position: !lambda |-
+                    const auto current_blind_ratio = ${current_blind_ratio};
+                    if(current_blind_ratio <= 0.001f)
+                      return COVER_OPEN;    // 1.0f
+                    if(current_blind_ratio >= 0.999f)
+                      return COVER_CLOSED;  // 0.0f
+                    return 1.0f - current_blind_ratio;
+          current_operation: !lambda |-
+                    if(id(current_blind_operation) < -0.01f)
+                      return COVER_OPERATION_OPENING;
+                    if(id(current_blind_operation) > 0.01f)
+                      return COVER_OPERATION_CLOSING;
+                    return COVER_OPERATION_IDLE;
+  - id: do_stop_blind_impl
+    then:
+      - globals.set:
+          id: current_blind_operation
+          value: '0.0f'
+      - output.set_level:
+          id: blind_forwards
+          level: '0%'
+      - output.set_level:
+          id: blind_backwards
+          level: '0%'
+  - id: do_position_blind
+    mode: restart    # WARNING: This script can reenter at any time!
+    parameters:
+      pos: float     # 0.0 = fully open, 1.0 = fully closed
+      speed: float   # 0.0 = stop, 1.0 = maximum speed, anywhere between is slower
+    then:
+      - if:
+          condition:
+            lambda: 'return speed == 0.0f;'
+          then:
+              - logger.log:
+                  format: "Blind position stop requested at %f"
+                  args: [ '${current_blind_ratio}' ]
+              - script.execute:
+                  id: do_stop_blind_impl
+              # The setting actually chosen
+              - globals.set:
+                  id: blind_encoder_rel_current
+                  value: !lambda 'return ${current_blind_ratio};'
+              - script.execute:
+                  id: do_publish_blind
+              - script.stop:
+                  id: do_position_blind
+      - globals.set:
+          id: blind_encoder_stop
+          value: !lambda 'return id(blind_encoder_abs_open_fully) + (int)((float) id(blind_encoder_rel_closed_fully) * pos);'
+      - globals.set:
+          id: old_current_blind_operation
+          value: '0.0f'
+      - logger.log:
+          format: "Blind position requested %f current position %f so start turning to %d when it is currently %f"
+          args: [ 'pos', '${current_blind_ratio}', 'id(blind_encoder_stop)', '${blind_encoder_state}' ]
+      - while:
+          condition:
+            lambda: 'return abs(${current_blind_ratio} - pos) > 0.001f;'
+          then:
+              - lambda: !lambda |-
+                  if(${blind_encoder_state} > id(blind_encoder_stop))
+                  {
+                    if(${blind_encoder_state} - id(blind_encoder_stop) <= ${blind_encoder_rel_slow_down})
+                      id(current_blind_operation) = -0.25f;
+                    else
+                      id(current_blind_operation) = -1.0f;
+                  }
+                  else
+                  {
+                    if(id(blind_encoder_stop) - ${blind_encoder_state} <= ${blind_encoder_rel_slow_down})
+                      id(current_blind_operation) = 0.25f;
+                    else
+                      id(current_blind_operation) = 1.0f;
+                  }
+                  if(id(old_current_blind_operation) == 0)
+                    id(old_current_blind_operation) = id(current_blind_operation);
+                  id(last_blind_encoder_state) = ${blind_encoder_state};
+              - script.execute:
+                  id: do_publish_blind
+              - output.set_level:
+                  id: blind_forwards
+                  level: !lambda 'return (id(current_blind_operation) > 0) ? id(current_blind_operation) : 0.0f;'
+              - output.set_level:
+                  id: blind_backwards
+                  level: !lambda 'return (id(current_blind_operation) < 0) ? -id(current_blind_operation) : 0.0f;'
+              - delay: 160ms  # ten ticks
+              - if:
+                  condition:
+                    lambda: 'return id(last_blind_encoder_state) == ${blind_encoder_state};'
+                  then:
+                      - logger.log:
+                          format: "Blind motor stopped turning at %f so turning off power"
+                          args: [ '${current_blind_ratio}' ]
+                      - if:
+                          condition:
+                            lambda: 'return id(old_current_blind_operation) < 0;'
+                          then:
+                              - logger.log:
+                                  format: "Resetting blind_encoder_abs_open_fully to %f"
+                                  args: [ '${blind_encoder_state}' ]
+                              - globals.set:
+                                  id: blind_encoder_abs_open_fully
+                                  value: !lambda 'return ${blind_encoder_state};'
+                      - script.execute:
+                          id: do_stop_blind_impl
+                      - script.execute:
+                          id: do_publish_blind
+                      - script.stop:
+                          id: do_position_blind
+      - logger.log:
+          format: "Blind position requested %f current position %f stop turning"
+          args: [ 'pos', '${current_blind_ratio}' ]
+      - globals.set:
+          id: blind_encoder_rel_current
+          value: !lambda 'return ${current_blind_ratio};'
+      - script.execute:
+          id: do_stop_blind_impl
+      - script.execute:
+          id: do_publish_blind
+
+number:
+  - platform: template
+    id: blind_encoder_rel_closed_fully_number
+    name: "Steps to fully close blind"
+    min_value: 0.0
+    max_value: 1000000.0
+    step: 1000.0
+    lambda: return (float) id(blind_encoder_rel_closed_fully);
+    set_action:
+      - globals.set:
+          id: blind_encoder_rel_closed_fully
+          value: !lambda return (int) x;
+
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk_mode: GPIO17_OUT
+  phy_addr: 0
+  power_pin: GPIO12
+  domain: .nedland
+  manual_ip:
+    static_ip: 192.168.22.51
+    gateway: 192.168.22.1
+    subnet: 255.255.255.0
+  use_address: 192.168.22.51
+
+i2c:
+  sda: SDA
+  scl: SCL
+  scan: true
+  frequency: 400kHz
+
+# LED
+output:
+#  - platform: gpio
+#    pin: GPIO1
+#    id: vent_enable
+  - platform: ledc
+    pin: GPIO0
+    id: red
+    frequency: "14648Hz"  # 60 Mhz clock so 4096 steps
+  - platform: ledc
+    pin: GPIO5
+    id: green
+    frequency: "14648Hz"  # 60 Mhz clock so 4096 steps
+  - platform: ledc
+    pin: GPIO14
+    id: blue
+    frequency: "14648Hz"  # 60 Mhz clock so 4096 steps
+  - platform: ledc
+    pin: GPIO15
+    id: white
+    frequency: "14648Hz"  # 60 Mhz clock so 4096 steps
+  - platform: ledc
+    pin: GPIO32
+    id: vent_forwards
+    frequency: "3662Hz"  # 16k steps
+  - platform: ledc
+    pin: GPIO33
+    id: vent_backwards
+    frequency: "3662Hz"  # 16k steps
+  - platform: ledc
+    pin: GPIO2
+    id: blind_forwards
+    frequency: "3662Hz"  # 16k steps
+  - platform: ledc
+    pin: GPIO3
+    id: blind_backwards
+    frequency: "3662Hz"  # 16k steps
+
+light:
+  - platform: rgbw
+    name: "LED strip light"
+    red: red
+    green: green
+    blue: blue
+    white: white
+    id: led1
+
+sensor:
+# Publish internal state
+#  - platform: template
+#    name: "Current blind operation"
+#    lambda: return id(current_blind_operation);
+#    # Defaults to updating every minute, can be changed using this:
+#    update_interval: 10s
+#  - platform: template
+#    name: "Current blind position"
+#    lambda: return ${current_blind_ratio};
+#    update_interval: 10s
+#  - platform: template
+#    name: "Fully open position"
+#    lambda: return id(blind_encoder_abs_open_fully);
+#    update_interval: 10s
+#  - platform: template
+#    name: "Fully closed position"
+#    lambda: return id(blind_encoder_abs_open_fully) + id(blind_encoder_rel_closed_fully);
+#    update_interval: 10s
+#  - platform: template
+#    name: "Last set position"
+#    lambda: return id(blind_encoder_abs_open_fully) + id(blind_encoder_rel_closed_fully) * id(blind_encoder_rel_current);
+#    update_interval: 10s
+#  - platform: template
+#    name: "Stop position"
+#    lambda: return id(blind_encoder_stop);
+#    update_interval: 10s
+
+  - platform: bme280_i2c
+    address: 0x76
+    temperature:
+      name: "BME280 Temperature"
+      oversampling: 1x
+      id: temp_1
+    pressure:
+      name: "BME280 Pressure"
+      oversampling: 1x
+      id: press_1
+    humidity:
+      name: "BME280 Humidity"
+      oversampling: 1x
+      id: hum_1
+  - platform: rotary_encoder
+    id: blind_encoder
+    pin_a: GPIO36
+    pin_b: GPIO4
+    resolution: 4
+    restore_mode: ALWAYS_ZERO
+  - platform: duty_cycle
+    id: dimmer_switch
+    pin: GPIO35
+    name: "Wall dimmer switch"
+#  - platform: internal_temperature
+#    name: "Internal Temperature"
+
+fan:
+  - platform: hbridge
+    id: ventilation_forwards
+    name: "Ventilation fan forwards"
+    pin_a: vent_forwards
+    pin_b: vent_backwards
+  - platform: hbridge
+    id: ventilation_backwards
+    name: "Ventilation fan backwards"
+    pin_a: vent_backwards
+    pin_b: vent_forwards
+
+cover:
+  - platform: template
+    id: blind_cover
+    name: "Blind"
+    has_position: true
+    open_action:
+      - script.execute:
+          id: do_position_blind
+          pos: 0.0  # inverted, 0.0 is fully open
+          speed: 1.0
+    close_action:
+      - script.execute:
+          id: do_position_blind
+          pos: 1.0  # inverted
+          speed: 1.0
+    stop_action:
+      - script.execute:
+          id: do_position_blind
+          pos: 0.0
+          speed: 0.0
+    position_action:
+      - script.execute:
+          id: do_position_blind
+          pos: !lambda 'return 1.0f - pos;'
+          speed: 1.0
+
+    
+# Enable logging
+logger:
+#  level: INFO
+#  level: VERY_VERBOSE
+
+# Enable Home Assistant API
+api:
+  password: "1234"
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: "1234"
+
+# Enable webserver
+web_server:
+  port: 80
+#  local: true  # whether use public internet for JS etc
+  version: 2
